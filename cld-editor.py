@@ -34,7 +34,9 @@ LINK_COLOR           = QColor("#374151")
 
 NODE_W, NODE_H = 130, 44
 ARROW_SIZE     = 10   # arrowhead depth in px
-
+LABEL_OFFSET = 16
+LABEL_T = 0.9
+LABEL_PERP = 15
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -60,16 +62,66 @@ def _border_intersection(node: "Node", path: QPainterPath) -> tuple[QPointF, flo
             return pt, t
     return path.pointAtPercent(0.0), 0.0
 
+def _src_border_intersection(node: "Node", path: QPainterPath) -> tuple[QPointF, float]:
+    """Walk forwards from t=0 until we leave the node bbox. Used for source."""
+    hw = NODE_W / 2 + 1
+    hh = NODE_H / 2 + 1
+    cp = node.scenePos()
+    for i in range(1, 100):
+        t  = i * 0.01
+        pt = path.pointAtPercent(min(t, 1.0))
+        if abs(pt.x() - cp.x()) > hw or abs(pt.y() - cp.y()) > hh:
+            return pt, t
+    return path.pointAtPercent(1.0), 1.0
+
+
+# ── Polarity dialog ───────────────────────────────────────────────────────────
+
+class PolarityDialog(QDialog):
+    """Ask the user: S (same) or O (opposite)?"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Link type")
+        self.polarity = "S"  # default
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Choose the link polarity:"))
+
+        row = QHBoxLayout()
+        self._s_btn = QPushButton("S  —  same polarity")
+        self._o_btn = QPushButton("O  —  opposite polarity")
+        self._s_btn.setCheckable(True)
+        self._o_btn.setCheckable(True)
+        self._s_btn.setChecked(True)
+        self._s_btn.clicked.connect(lambda: self._select("S"))
+        self._o_btn.clicked.connect(lambda: self._select("O"))
+        row.addWidget(self._s_btn)
+        row.addWidget(self._o_btn)
+        layout.addLayout(row)
+
+        ok = QPushButton("Add link")
+        ok.clicked.connect(self.accept)
+        layout.addWidget(ok)
+        self.setFixedWidth(300)
+
+    def _select(self, p: str):
+        self.polarity = p
+        self._s_btn.setChecked(p == "S")
+        self._o_btn.setChecked(p == "O")
 
 # ── Link ──────────────────────────────────────────────────────────────────────
 
 class Link(QGraphicsPathItem):
     """Curved arrow between two Nodes."""
 
-    def __init__(self, src: "Node", dst: "Node"):
+    def __init__(self, src: "Node", dst: "Node", polarity: str = "S"):
         super().__init__()
         self.src = src
         self.dst = dst
+        self.polarity = polarity
+
+        self.setPos(0, 0)
         self.setZValue(0)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable)
         self.setAcceptHoverEvents(True)
@@ -115,18 +167,43 @@ class Link(QGraphicsPathItem):
                 base_t = t
                 break
 
+        # --- source: find where the curve exits the src border ---
+        src_border_pt, src_t = _src_border_intersection(self.src, full)
+
+        # build the stroke only between the two borders (src_t → base_t)
         stroke = QPainterPath()
-        stroke.moveTo(full.pointAtPercent(0))
+        stroke.moveTo(src_border_pt)
         STEPS = 60
         for i in range(1, STEPS + 1):
-            stroke.lineTo(full.pointAtPercent(base_t * i / STEPS))
+            t = src_t + (base_t - src_t) * i / STEPS
+            stroke.lineTo(full.pointAtPercent(t))
+
+        # label position: LABEL_OFFSET px past the tip along the arrow direction
+        # Label sits at a fixed position along the drawn stroke (0.0 = src, 1.0 = arrowhead base).
+        # Sampling from stroke (not full) means the position is always visually accurate.
+        # label position: LABEL_OFFSET px past the tip along the arrow direction
+        # Sample a point on the stroke and offset it perpendicularly.
+        # The perpendicular is the tangent rotated 90 degrees.
+        lp = stroke.pointAtPercent(LABEL_T)
+        la = stroke.pointAtPercent(max(LABEL_T - 0.01, 0.0))
+        lb = stroke.pointAtPercent(min(LABEL_T + 0.01, 1.0))
+        tdx = lb.x() - la.x()
+        tdy = lb.y() - la.y()
+        mag = math.hypot(tdx, tdy) or 1
+        # perpendicular: rotate tangent 90 degrees counter-clockwise (-tdy, tdx)
+        px = -tdy / mag
+        py = tdx / mag
+        self._label_pos = QPointF(
+            lp.x() + px * LABEL_PERP,
+            lp.y() + py * LABEL_PERP,
+        )
 
         self.setPath(stroke)
         self.prepareGeometryChange()
 
     def boundingRect(self):
-        extra = ARROW_SIZE + 4
-        return self.path().boundingRect().adjusted(-extra, -extra, extra, extra)
+        pad = ARROW_SIZE + LABEL_OFFSET + 20  # enough for label text
+        return self.path().boundingRect().adjusted(-pad, -pad, pad, pad)
 
     # ── painting ──────────────────────────────────────────────────────────────
 
@@ -157,18 +234,40 @@ class Link(QGraphicsPathItem):
         painter.setBrush(QBrush(color))
         painter.drawPath(head)
 
+        # polarity label past the tip
+        font = QFont("Segoe UI", 9, QFont.Weight.Bold)
+        painter.setFont(font)
+        painter.setPen(QPen(color))
+        fm = painter.fontMetrics()
+        lp = self._label_pos
+        tw = fm.horizontalAdvance(self.polarity)
+        painter.drawText(
+            QPointF(lp.x() - tw / 2, lp.y() + fm.ascent() / 2),
+            self.polarity,
+        )
+
+    # ── interaction ───────────────────────────────────────────────────────────
+
     def hoverEnterEvent(self, event):
         self.setSelected(True)
 
     def hoverLeaveEvent(self, event):
         self.setSelected(False)
 
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.RightButton:
+            canvas = self.scene().views()[0]
+            canvas.remove_link(self)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
     def cleanup(self):
-        """Detach from src/dst node lists."""
         if self in self.src.links:
             self.src.links.remove(self)
         if self in self.dst.links:
             self.dst.links.remove(self)
+
 
 # ── Node ──────────────────────────────────────────────────────────────────────
 
@@ -212,6 +311,9 @@ class Node(QGraphicsRectItem):
         self._pending = val
         self.update()
 
+    def is_pending(self) -> bool:
+        return self._pending
+
     # ── painting ──────────────────────────────────────────────────────────────
 
     def paint(self, painter, option, widget=None):
@@ -237,18 +339,17 @@ class Node(QGraphicsRectItem):
                 link._refresh()
         return super().itemChange(change, value)
 
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.RightButton:
+            canvas = self.scene().views()[0]
+            canvas.remove_node(self)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
 
     def mouseDoubleClickEvent(self, event):
         self._label.setFocus()
-
-    def keyPressEvent(self, event):
-        if event.key() == Qt.Key.Key_Delete:
-            scene = self.scene()
-            if scene:
-                scene.removeItem(self)
-        else:
-            super().keyPressEvent(event)
-
 
 # ── Canvas ────────────────────────────────────────────────────────────────────
 
@@ -271,6 +372,7 @@ class Canvas(QGraphicsView):
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
         self._panning = False
+        self._holding = False
         self._pan_start = QPointF()
         self._link_source: Node | None = None  # node waiting for a target
 
@@ -311,6 +413,10 @@ class Canvas(QGraphicsView):
                     return p
         return None
 
+    def remove_link(self, link: Link):
+        link.cleanup()
+        self._scene.removeItem(link)
+
     def remove_node(self, node: Node):
         for link in list(node.links):
             link.cleanup()
@@ -334,6 +440,7 @@ class Canvas(QGraphicsView):
             return
 
         if event.button() == Qt.MouseButton.LeftButton:
+            self._holding = True
             node = self._node_at(event.pos())
             if node:
                 if self._link_source is None:
@@ -345,18 +452,23 @@ class Canvas(QGraphicsView):
                     src = self._link_source
                     self._cancel_link()
                     if node is not src:
-                        link = Link(src, node)
-                        self._scene.addItem(link)
-                        # repaint
-                        self.update()
+                        dlg = PolarityDialog()
+                        if dlg.exec() == QDialog.DialogCode.Accepted:
+                            link = Link(src, node, dlg.polarity)
+                            self._scene.addItem(link)
+                            self.update()
+
                 super().mousePressEvent(event)
                 return   # don't pass to base (prevents accidental drag-select)
 
             self._cancel_link()  # clicked on empty space, cancel any pending link
+
             # unselect all nodes if clicked on empty space
             for item in self._scene.selectedItems():
                 if isinstance(item, Node):
                     item.setSelected(False)
+
+        super().mousePressEvent(event)
 
 
     def mouseMoveEvent(self, event):
@@ -368,6 +480,13 @@ class Canvas(QGraphicsView):
             self.verticalScrollBar().setValue(
                 self.verticalScrollBar().value() - int(delta.y()))
         else:
+
+            node = self._node_at(event.pos())
+            if node:
+                if node.is_pending() and self._holding:
+                    self._cancel_link()
+                    node.set_pending(False)
+
             super().mouseMoveEvent(event)
             self.update()
 
@@ -376,6 +495,7 @@ class Canvas(QGraphicsView):
             self._panning = False
             self.setCursor(Qt.CursorShape.ArrowCursor)
         else:
+            self._holding = False
             super().mouseReleaseEvent(event)
             self.update()
 
